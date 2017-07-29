@@ -219,7 +219,7 @@ classify_argument (ffi_type *type, enum x86_64_reg_class classes[],
 	const size_t UNITS_PER_WORD = 8;
 	size_t words = (type->size + UNITS_PER_WORD - 1) / UNITS_PER_WORD;
 	ffi_type **ptr;
-	int i;
+	unsigned int i;
 	enum x86_64_reg_class subclasses[MAX_CLASSES];
 
 	/* If the struct is larger than 32 bytes, pass it on the stack.  */
@@ -243,7 +243,7 @@ classify_argument (ffi_type *type, enum x86_64_reg_class classes[],
 	  {
 	    size_t num;
 
-	    byte_offset = ALIGN (byte_offset, (*ptr)->alignment);
+	    byte_offset = FFI_ALIGN (byte_offset, (*ptr)->alignment);
 
 	    num = classify_argument (*ptr, subclasses, byte_offset % 8);
 	    if (num == 0)
@@ -350,7 +350,8 @@ examine_argument (ffi_type *type, enum x86_64_reg_class classes[MAX_CLASSES],
 		  _Bool in_return, int *pngpr, int *pnsse)
 {
   size_t n;
-  int i, ngpr, nsse;
+  unsigned int i;
+  int ngpr, nsse;
 
   n = classify_argument (type, classes, 0);
   if (n == 0)
@@ -388,6 +389,9 @@ examine_argument (ffi_type *type, enum x86_64_reg_class classes[MAX_CLASSES],
 
 /* Perform machine dependent cif processing.  */
 
+extern ffi_status
+ffi_prep_cif_machdep_efi64(ffi_cif *cif);
+
 ffi_status
 ffi_prep_cif_machdep (ffi_cif *cif)
 {
@@ -396,6 +400,8 @@ ffi_prep_cif_machdep (ffi_cif *cif)
   size_t bytes, n, rtype_size;
   ffi_type *rtype;
 
+  if (cif->abi == FFI_EFI64)
+    return ffi_prep_cif_machdep_efi64(cif);
   if (cif->abi != FFI_UNIX64)
     return FFI_BAD_ABI;
 
@@ -523,7 +529,7 @@ ffi_prep_cif_machdep (ffi_cif *cif)
 	  if (align < 8)
 	    align = 8;
 
-	  bytes = ALIGN (bytes, align);
+	  bytes = FFI_ALIGN (bytes, align);
 	  bytes += cif->arg_types[i]->size;
 	}
       else
@@ -536,7 +542,7 @@ ffi_prep_cif_machdep (ffi_cif *cif)
     flags |= UNIX64_FLAG_XMM_ARGS;
 
   cif->flags = flags;
-  cif->bytes = ALIGN (bytes, 8);
+  cif->bytes = FFI_ALIGN (bytes, 8);
 
   return FFI_OK;
 }
@@ -598,7 +604,7 @@ ffi_call_int (ffi_cif *cif, void (*fn)(void), void *rvalue,
 	    align = 8;
 
 	  /* Pass this argument in memory.  */
-	  argp = (void *) ALIGN (argp, align);
+	  argp = (void *) FFI_ALIGN (argp, align);
 	  memcpy (argp, avalue[i], size);
 	  argp += size;
 	}
@@ -606,7 +612,7 @@ ffi_call_int (ffi_cif *cif, void (*fn)(void), void *rvalue,
 	{
 	  /* The argument is passed entirely in registers.  */
 	  char *a = (char *) avalue[i];
-	  int j;
+	  unsigned int j;
 
 	  for (j = 0; j < n; j++, a += 8, size -= 8)
 	    {
@@ -657,21 +663,40 @@ ffi_call_int (ffi_cif *cif, void (*fn)(void), void *rvalue,
 		   flags, rvalue, fn);
 }
 
+extern void
+ffi_call_efi64(ffi_cif *cif, void (*fn)(void), void *rvalue, void **avalue);
+
 void
 ffi_call (ffi_cif *cif, void (*fn)(void), void *rvalue, void **avalue)
 {
+  if (cif->abi == FFI_EFI64)
+    return ffi_call_efi64(cif, fn, rvalue, avalue);
   ffi_call_int (cif, fn, rvalue, avalue, NULL);
 }
+
+extern void
+ffi_call_go_efi64(ffi_cif *cif, void (*fn)(void), void *rvalue,
+		  void **avalue, void *closure);
 
 void
 ffi_call_go (ffi_cif *cif, void (*fn)(void), void *rvalue,
 	     void **avalue, void *closure)
 {
+  if (cif->abi == FFI_EFI64)
+    ffi_call_go_efi64(cif, fn, rvalue, avalue, closure);
   ffi_call_int (cif, fn, rvalue, avalue, closure);
 }
 
+
 extern void ffi_closure_unix64(void) FFI_HIDDEN;
 extern void ffi_closure_unix64_sse(void) FFI_HIDDEN;
+
+extern ffi_status
+ffi_prep_closure_loc_efi64(ffi_closure* closure,
+			   ffi_cif* cif,
+			   void (*fun)(ffi_cif*, void*, void**, void*),
+			   void *user_data,
+			   void *codeloc);
 
 ffi_status
 ffi_prep_closure_loc (ffi_closure* closure,
@@ -691,6 +716,8 @@ ffi_prep_closure_loc (ffi_closure* closure,
   void (*dest)(void);
   char *tramp = closure->tramp;
 
+  if (cif->abi == FFI_EFI64)
+    return ffi_prep_closure_loc_efi64(closure, cif, fun, user_data, codeloc);
   if (cif->abi != FFI_UNIX64)
     return FFI_BAD_ABI;
 
@@ -756,7 +783,7 @@ ffi_closure_unix64_inner(ffi_cif *cif,
 	    align = 8;
 
 	  /* Pass this argument in memory.  */
-	  argp = (void *) ALIGN (argp, align);
+	  argp = (void *) FFI_ALIGN (argp, align);
 	  avalue[i] = argp;
 	  argp += arg_types[i]->size;
 	}
@@ -782,7 +809,7 @@ ffi_closure_unix64_inner(ffi_cif *cif,
       else
 	{
 	  char *a = alloca (16);
-	  int j;
+	  unsigned int j;
 
 	  avalue[i] = a;
 	  for (j = 0; j < n; j++, a += 8)
@@ -805,10 +832,16 @@ ffi_closure_unix64_inner(ffi_cif *cif,
 extern void ffi_go_closure_unix64(void) FFI_HIDDEN;
 extern void ffi_go_closure_unix64_sse(void) FFI_HIDDEN;
 
+extern ffi_status
+ffi_prep_go_closure_efi64(ffi_go_closure* closure, ffi_cif* cif,
+			  void (*fun)(ffi_cif*, void*, void**, void*));
+
 ffi_status
 ffi_prep_go_closure (ffi_go_closure* closure, ffi_cif* cif,
 		     void (*fun)(ffi_cif*, void*, void**, void*))
 {
+  if (cif->abi == FFI_EFI64)
+    return ffi_prep_go_closure_efi64(closure, cif, fun);
   if (cif->abi != FFI_UNIX64)
     return FFI_BAD_ABI;
 

@@ -33,3 +33,5 @@ libffi.xcodeproj/xcuserdata
 libffi.xcodeproj/project.xcworkspace
 build_*/
 darwin_*/
+src/arm/trampoline.S
+**/texinfo.tex

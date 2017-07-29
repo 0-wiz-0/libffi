@@ -30,11 +30,12 @@
 #define _GNU_SOURCE 1
 #endif
 
+#include <fficonfig.h>
 #include <ffi.h>
 #include <ffi_common.h>
 
 #if !FFI_MMAP_EXEC_WRIT && !FFI_EXEC_TRAMPOLINE_TABLE
-# if __gnu_linux__ && !defined(__ANDROID__)
+# if __linux__ && !defined(__ANDROID__)
 /* This macro indicates it may be forbidden to map anonymous memory
    with both write and execute permission.  Code compiled when this
    option is defined will attempt to map such pages once, but if it
@@ -64,11 +65,248 @@
 
 #if FFI_CLOSURES
 
-# if FFI_EXEC_TRAMPOLINE_TABLE
+#if FFI_EXEC_TRAMPOLINE_TABLE
+
+#ifdef __MACH__
+
+#include <mach/mach.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+extern void *ffi_closure_trampoline_table_page;
+
+typedef struct ffi_trampoline_table ffi_trampoline_table;
+typedef struct ffi_trampoline_table_entry ffi_trampoline_table_entry;
+
+struct ffi_trampoline_table
+{
+  /* contiguous writable and executable pages */
+  vm_address_t config_page;
+  vm_address_t trampoline_page;
+
+  /* free list tracking */
+  uint16_t free_count;
+  ffi_trampoline_table_entry *free_list;
+  ffi_trampoline_table_entry *free_list_pool;
+
+  ffi_trampoline_table *prev;
+  ffi_trampoline_table *next;
+};
+
+struct ffi_trampoline_table_entry
+{
+  void *(*trampoline) ();
+  ffi_trampoline_table_entry *next;
+};
+
+/* Total number of trampolines that fit in one trampoline table */
+#define FFI_TRAMPOLINE_COUNT (PAGE_MAX_SIZE / FFI_TRAMPOLINE_SIZE)
+
+static pthread_mutex_t ffi_trampoline_lock = PTHREAD_MUTEX_INITIALIZER;
+static ffi_trampoline_table *ffi_trampoline_tables = NULL;
+
+static ffi_trampoline_table *
+ffi_trampoline_table_alloc ()
+{
+  ffi_trampoline_table *table = NULL;
+
+  /* Loop until we can allocate two contiguous pages */
+  while (table == NULL)
+    {
+      vm_address_t config_page = 0x0;
+      kern_return_t kt;
+
+      /* Try to allocate two pages */
+      kt =
+	vm_allocate (mach_task_self (), &config_page, PAGE_MAX_SIZE * 2,
+		     VM_FLAGS_ANYWHERE);
+      if (kt != KERN_SUCCESS)
+	{
+	  fprintf (stderr, "vm_allocate() failure: %d at %s:%d\n", kt,
+		   __FILE__, __LINE__);
+	  break;
+	}
+
+      /* Now drop the second half of the allocation to make room for the trampoline table */
+      vm_address_t trampoline_page = config_page + PAGE_MAX_SIZE;
+      kt = vm_deallocate (mach_task_self (), trampoline_page, PAGE_MAX_SIZE);
+      if (kt != KERN_SUCCESS)
+	{
+	  fprintf (stderr, "vm_deallocate() failure: %d at %s:%d\n", kt,
+		   __FILE__, __LINE__);
+	  break;
+	}
+
+      /* Remap the trampoline table to directly follow the config page */
+      vm_prot_t cur_prot;
+      vm_prot_t max_prot;
+
+	  vm_address_t trampoline_page_template = (vm_address_t)&ffi_closure_trampoline_table_page;
+#ifdef __arm__
+	  /* ffi_closure_trampoline_table_page can be thumb-biased on some ARM archs */
+	  trampoline_page_template &= ~1UL;
+#endif
+
+      kt =
+	vm_remap (mach_task_self (), &trampoline_page, PAGE_MAX_SIZE, 0x0, FALSE,
+		  mach_task_self (), trampoline_page_template, FALSE,
+		  &cur_prot, &max_prot, VM_INHERIT_SHARE);
+
+      /* If we lost access to the destination trampoline page, drop our config allocation mapping and retry */
+      if (kt != KERN_SUCCESS)
+	{
+	  /* Log unexpected failures */
+	  if (kt != KERN_NO_SPACE)
+	    {
+	      fprintf (stderr, "vm_remap() failure: %d at %s:%d\n", kt,
+		       __FILE__, __LINE__);
+	    }
+
+	  vm_deallocate (mach_task_self (), config_page, PAGE_SIZE);
+	  continue;
+	}
+
+      /* We have valid trampoline and config pages */
+      table = calloc (1, sizeof (ffi_trampoline_table));
+      table->free_count = FFI_TRAMPOLINE_COUNT;
+      table->config_page = config_page;
+      table->trampoline_page = trampoline_page;
+
+      /* Create and initialize the free list */
+      table->free_list_pool =
+	calloc (FFI_TRAMPOLINE_COUNT, sizeof (ffi_trampoline_table_entry));
+
+      uint16_t i;
+      for (i = 0; i < table->free_count; i++)
+	{
+	  ffi_trampoline_table_entry *entry = &table->free_list_pool[i];
+	  entry->trampoline =
+	    (void *) (table->trampoline_page + (i * FFI_TRAMPOLINE_SIZE));
+
+	  if (i < table->free_count - 1)
+	    entry->next = &table->free_list_pool[i + 1];
+	}
+
+      table->free_list = table->free_list_pool;
+    }
+
+  return table;
+}
+
+void *
+ffi_closure_alloc (size_t size, void **code)
+{
+  /* Create the closure */
+  ffi_closure *closure = malloc (size);
+  if (closure == NULL)
+    return NULL;
+
+  pthread_mutex_lock (&ffi_trampoline_lock);
+
+  /* Check for an active trampoline table with available entries. */
+  ffi_trampoline_table *table = ffi_trampoline_tables;
+  if (table == NULL || table->free_list == NULL)
+    {
+      table = ffi_trampoline_table_alloc ();
+      if (table == NULL)
+	{
+	  pthread_mutex_unlock (&ffi_trampoline_lock);
+	  free (closure);
+	  return NULL;
+	}
+
+      /* Insert the new table at the top of the list */
+      table->next = ffi_trampoline_tables;
+      if (table->next != NULL)
+	table->next->prev = table;
+
+      ffi_trampoline_tables = table;
+    }
+
+  /* Claim the free entry */
+  ffi_trampoline_table_entry *entry = ffi_trampoline_tables->free_list;
+  ffi_trampoline_tables->free_list = entry->next;
+  ffi_trampoline_tables->free_count--;
+  entry->next = NULL;
+
+  pthread_mutex_unlock (&ffi_trampoline_lock);
+
+  /* Initialize the return values */
+  *code = entry->trampoline;
+  closure->trampoline_table = table;
+  closure->trampoline_table_entry = entry;
+
+  return closure;
+}
+
+void
+ffi_closure_free (void *ptr)
+{
+  ffi_closure *closure = ptr;
+
+  pthread_mutex_lock (&ffi_trampoline_lock);
+
+  /* Fetch the table and entry references */
+  ffi_trampoline_table *table = closure->trampoline_table;
+  ffi_trampoline_table_entry *entry = closure->trampoline_table_entry;
+
+  /* Return the entry to the free list */
+  entry->next = table->free_list;
+  table->free_list = entry;
+  table->free_count++;
+
+  /* If all trampolines within this table are free, and at least one other table exists, deallocate
+   * the table */
+  if (table->free_count == FFI_TRAMPOLINE_COUNT
+      && ffi_trampoline_tables != table)
+    {
+      /* Remove from the list */
+      if (table->prev != NULL)
+	table->prev->next = table->next;
+
+      if (table->next != NULL)
+	table->next->prev = table->prev;
+
+      /* Deallocate pages */
+      kern_return_t kt;
+      kt = vm_deallocate (mach_task_self (), table->config_page, PAGE_SIZE);
+      if (kt != KERN_SUCCESS)
+	fprintf (stderr, "vm_deallocate() failure: %d at %s:%d\n", kt,
+		 __FILE__, __LINE__);
+
+      kt =
+	vm_deallocate (mach_task_self (), table->trampoline_page, PAGE_SIZE);
+      if (kt != KERN_SUCCESS)
+	fprintf (stderr, "vm_deallocate() failure: %d at %s:%d\n", kt,
+		 __FILE__, __LINE__);
+
+      /* Deallocate free list */
+      free (table->free_list_pool);
+      free (table);
+    }
+  else if (ffi_trampoline_tables != table)
+    {
+      /* Otherwise, bump this table to the top of the list */
+      table->prev = NULL;
+      table->next = ffi_trampoline_tables;
+      if (ffi_trampoline_tables != NULL)
+	ffi_trampoline_tables->prev = table;
+
+      ffi_trampoline_tables = table;
+    }
+
+  pthread_mutex_unlock (&ffi_trampoline_lock);
+
+  /* Free the closure */
+  free (closure);
+}
+
+#endif
 
 // Per-target implementation; It's unclear what can reasonable be shared between two OS/architecture implementations.
 
-# elif FFI_MMAP_EXEC_WRIT /* !FFI_EXEC_TRAMPOLINE_TABLE */
+#elif FFI_MMAP_EXEC_WRIT /* !FFI_EXEC_TRAMPOLINE_TABLE */
 
 #define USE_LOCKS 1
 #define USE_DL_PREFIX 1
@@ -93,14 +331,6 @@
 
 /* Don't allocate more than a page unless needed.  */
 #define DEFAULT_GRANULARITY ((size_t)malloc_getpagesize)
-
-#if FFI_CLOSURE_TEST
-/* Don't release single pages, to avoid a worst-case scenario of
-   continuously allocating and releasing single pages, but release
-   pairs of pages, which should do just as well given that allocations
-   are likely to be small.  */
-#define DEFAULT_TRIM_THRESHOLD ((size_t)malloc_getpagesize)
-#endif
 
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -521,10 +751,6 @@ dlmmap (void *start, size_t length, int prot,
 	  && flags == (MAP_PRIVATE | MAP_ANONYMOUS)
 	  && fd == -1 && offset == 0);
 
-#if FFI_CLOSURE_TEST
-  printf ("mapping in %zi\n", length);
-#endif
-
   if (execfd == -1 && is_emutramp_enabled ())
     {
       ptr = mmap (start, length, prot & ~PROT_EXEC, flags, fd, offset);
@@ -569,10 +795,6 @@ dlmunmap (void *start, size_t length)
      Yuck.  */
   msegmentptr seg = segment_holding (gm, start);
   void *code;
-
-#if FFI_CLOSURE_TEST
-  printf ("unmapping %zi\n", length);
-#endif
 
   if (seg && (code = add_segment_exec_offset (start, seg)) != start)
     {
@@ -642,26 +864,6 @@ ffi_closure_free (void *ptr)
   dlfree (ptr);
 }
 
-
-#if FFI_CLOSURE_TEST
-/* Do some internal sanity testing to make sure allocation and
-   deallocation of pages are working as intended.  */
-int main ()
-{
-  void *p[3];
-#define GET(idx, len) do { p[idx] = dlmalloc (len); printf ("allocated %zi for p[%i]\n", (len), (idx)); } while (0)
-#define PUT(idx) do { printf ("freeing p[%i]\n", (idx)); dlfree (p[idx]); } while (0)
-  GET (0, malloc_getpagesize / 2);
-  GET (1, 2 * malloc_getpagesize - 64 * sizeof (void*));
-  PUT (1);
-  GET (1, 2 * malloc_getpagesize);
-  GET (2, malloc_getpagesize / 2);
-  PUT (1);
-  PUT (0);
-  PUT (2);
-  return 0;
-}
-#endif /* FFI_CLOSURE_TEST */
 # else /* ! FFI_MMAP_EXEC_WRIT */
 
 /* On many systems, memory returned by malloc is writable and
